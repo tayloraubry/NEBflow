@@ -1,4 +1,4 @@
-# aseflow
+# NEBflow
 ASE-based workflow utilities for automated NEB calculations, including interpolation, MACE NEB runs, and optional DFT single-point calculations.
 
 ## Installation
