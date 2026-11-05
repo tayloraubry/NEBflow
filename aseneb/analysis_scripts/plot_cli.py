@@ -10,19 +10,17 @@ def load_processed_summary(base_path):
     if not os.path.exists(input_file):
         raise FileNotFoundError(
             f"Processed summary not found: {input_file}\n"
-            "Run aseneb analysis first to generate it."
+            "Run aseneb-analyze, then aseneb-summarize, first to generate it."
         )
 
     sheets = pd.read_excel(
         input_file,
-        sheet_name=["raw", "averaged", "min_barriers", "min_deltaEs"],
+        sheet_name=["averaged_barriers", "min_barriers"],
     )
 
     return (
-        sheets["raw"],
-        sheets["averaged"],
+        sheets["averaged_barriers"],
         sheets["min_barriers"],
-        sheets["min_deltaEs"],
     )
 
 def main():
@@ -38,10 +36,11 @@ def main():
     parser.add_argument("--use-min", action="store_true")
     parser.add_argument("--only-singles", action="store_true")
     parser.add_argument("--model-name", default="Model", help="Model name, only affects plot title and file name")
+    parser.add_argument("--full-reaction",action="store_true",help="Label the y-axis with the full reaction instead of only the reactant")
 
     args = parser.parse_args()
 
-    df, df_avg, df_min_barrier, df_min_deltaE = load_processed_summary(args.base_path)
+    df_avg, df_min_barrier = load_processed_summary(args.base_path)
 
     data = df_min_barrier if args.use_min else df_avg
 
@@ -50,4 +49,5 @@ def main():
         use_min=args.use_min,
         only_singles=args.only_singles,
         model_name=args.model_name,
+        reactant_only=not args.full_reaction,
     )

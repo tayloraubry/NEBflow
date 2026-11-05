@@ -40,7 +40,7 @@ def main():
 
     parser.add_argument("--force-rerun", action="store_true", help="Recompute NEB analysis even if neb_summary.xlsx already exists (overwrites existing results).")
 
-    parser.add_argument("--max-path-length", type=float, default=25.0, help="Maximum allowed path length for NEB paths, default: 25.0")
+    parser.add_argument("--rotations-sampling", action="store_true", help="Folder names include halide ordering, e.g. C10-ZnN4C+FeBr1F2_Br-F-F_c_TO_C10-FeN4C+ZnBr1F2_Br-F-F_c")
 
 
     args = parser.parse_args()
@@ -58,7 +58,7 @@ def main():
         do_write_structures=args.write_snapshots,
         do_write_movie=args.create_movie,
         force_rerun=args.force_rerun,
-        max_path_length=args.max_path_length,
+        rotations_sampling=args.rotations_sampling,
     )
 
 

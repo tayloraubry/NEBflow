@@ -24,6 +24,7 @@ from pymatgen.io.jdftx.outputs import JDFTXOutfile
 from ase.calculators.singlepoint import SinglePointCalculator
 
 Ha2eV = physical_constants['Hartree energy in eV'][0]
+HALIDES = ("F", "Cl", "Br", "I")
 
 # ============================== Core Functions ==============================
 
@@ -255,11 +256,27 @@ def make_rxn(system):
     right_clean = strip_config(right)
     return f"{left_clean}_TO_{right_clean}"
 
-def parse_system(system):
+def split_halide_order(name):
+    """Split 'C10-ZnN4C+FeBr1F2_Br-F-F' into ('C10-ZnN4C+FeBr1F2', 'Br-F-F')."""
+    m = re.match(r"(.+)_([A-Z][a-z]?(?:-[A-Z][a-z]?)*)$", name)
+    if m:
+        return m.group(1), m.group(2)
+    return name, None
+
+def get_halide_composition(name):
+    """'C10-ZnN4C+FeBr1F2' -> 'Br1F2'"""
+    tokens = re.findall(r"([A-Z][a-z]?)(\d*)", re.sub(r"^C\d+-", "", name))
+    return "".join(f"{el}{n}" for el, n in tokens if el in HALIDES)
+
+def parse_system(system, rotations_sampling=False):
     left, right = system.split("_TO_")
 
     # --- config-aware parsing ---
     base_left, orient = split_orientation(left)
+
+    halide_order = None
+    if rotations_sampling:
+        base_left, halide_order = split_halide_order(base_left)
 
     scaffold = get_scaffold(base_left)
     stoch = parse_stoichiometry(base_left)
@@ -274,9 +291,16 @@ def parse_system(system):
     # --- config-independent rxn ---
     left_clean = strip_config(left)
     right_clean = strip_config(right)
+    if rotations_sampling:
+        # rxn ignores halide order so aggregation spans all orderings
+        left_clean = split_halide_order(left_clean)[0]
+        right_clean = split_halide_order(right_clean)[0]
     rxn = f"{left_clean}_TO_{right_clean}"
 
-    return pd.Series([rxn, scaffold, orient, rxn_type, halide_type, halide_ids])
+    values = [rxn, scaffold, orient, rxn_type, halide_type, halide_ids]
+    if rotations_sampling:
+        values += [get_halide_composition(base_left), halide_order]
+    return pd.Series(values)
 
 # ============================== NEB PLOTTING ==============================
 
@@ -890,38 +914,18 @@ def create_movie(folder, n_steps, n_images):
     )
 # ============================== SUMMARY SHEETS AND PLOTS ==============================
 
-def process_summary(
-    base_path,
-    max_path_length=None,
-):
+def tag_summary(base_path, rotations_sampling=False):
+    """neb_summary.xlsx -> neb_summary_tagged.xlsx (all rows, parsed name columns added)."""
     input_file = os.path.join(base_path, "neb_summary.xlsx")
-    output_file = os.path.join(base_path, "neb_summary_processed.xlsx")
+    output_file = os.path.join(base_path, "neb_summary_tagged.xlsx")
 
     df = pd.read_excel(input_file)
 
-    n_before = len(df)
-
-    # Explicit convergence flag filter
-    if "converged" in df.columns:
-        df = df[df["converged"]]
-
-    n_after_conv = len(df)
-
-    # Path length filter
-    if max_path_length is not None and "path_length_A" in df.columns:
-        df = df[df["path_length_A"] <= max_path_length]
-
-    n_after_path = len(df)
-
-    print(
-        f"Filtered summary: "
-        f"{n_before - n_after_conv} unconverged removed, "
-        f"{n_after_conv - n_after_path} path-length outliers removed."
-    )
-    
     # Add parsed columns
     new_cols = ["rxn", "scaffold", "orient", "rxn_type", "halide_type", "halide_ids"]
-    df[new_cols] = df["system"].apply(parse_system)
+    if rotations_sampling:
+        new_cols += ["halide_composition", "halide_order"]
+    df[new_cols] = df["system"].apply(lambda s: parse_system(s, rotations_sampling))
 
     # Reorder columns
     sys_i = df.columns.get_loc("system") + 1
@@ -936,46 +940,94 @@ def process_summary(
     # Sort
     df = df.sort_values(by="barrier_eV", ascending=True, na_position="last").reset_index(drop=True)
 
+    df.to_excel(output_file, index=False)
+
+    print(f"\nTagged summary written to: {output_file}")
+
+    return df
+
+def process_tagged_summary(
+    base_path,
+    max_path_length=None,
+    include_unconverged=False,
+    max_delta_e=0.0,
+    group_by=("rxn",),
+):
+    """neb_summary_tagged.xlsx -> neb_summary_processed.xlsx (downselected, averaged_barriers, min_barriers)."""
+    input_file = os.path.join(base_path, "neb_summary_tagged.xlsx")
+    output_file = os.path.join(base_path, "neb_summary_processed.xlsx")
+
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(
+            f"Tagged summary not found: {input_file}\n"
+            "Run aseneb-analyze first to generate it."
+        )
+
+    df = pd.read_excel(input_file)
+
+    group_by = list(group_by)
+    missing = [c for c in group_by if c not in df.columns]
+    if missing:
+        raise ValueError(f"--group-by columns not in tagged summary: {missing}. Available: {list(df.columns)}")
+
+    n_before = len(df)
+
+    if not include_unconverged and "converged" in df.columns:
+        df = df[df["converged"]]
+
+    n_after_conv = len(df)
+
+    if max_path_length is not None and "path_length_A" in df.columns:
+        df = df[df["path_length_A"] <= max_path_length]
+
+    n_after_path = len(df)
+
+    if max_delta_e is not None and "deltaE_eV" in df.columns:
+        df = df[df["deltaE_eV"] <= max_delta_e]
+
+    n_after_dE = len(df)
+
+    print(
+        f"Downselected {n_after_dE}/{n_before}: "
+        f"{n_before - n_after_conv} unconverged, "
+        f"{n_after_conv - n_after_path} path-length outliers, "
+        f"{n_after_path - n_after_dE} with deltaE > {max_delta_e} eV removed."
+    )
+
+    df = df.reset_index(drop=True)
+
     # Aggregations
+    first_cols = ["scaffold", "rxn_type", "halide_type", "halide_ids", "halide_composition"]
+    mean_cols = ["barrier_eV", "deltaE_eV", "path_length_A", "rmse_eV", "avg_bias_eV"]
+    agg_spec = {c: "first" for c in first_cols if c in df.columns and c not in group_by}
+    agg_spec.update({c: "mean" for c in mean_cols if c in df.columns and c not in group_by})
+
     df_avg = (
-        df.groupby("rxn", as_index=False)
-        .agg({
-            "scaffold": "first",
-            "rxn_type": "first",
-            "halide_type": "first",
-            "halide_ids": "first",
-            "barrier_eV": "mean",
-            "deltaE_eV": "mean",
-            "path_length_A": "mean",
-            "rmse_eV": "mean",
-            "avg_bias_eV": "mean",
-        })
+        df.groupby(group_by, as_index=False)
+        .agg(agg_spec)
         .sort_values(by="barrier_eV", ascending=True)
         .reset_index(drop=True)
     )
 
-    df_min_barrier = df.loc[df.groupby("rxn")["barrier_eV"].idxmin()] \
+    df_min_barrier = df.loc[df.groupby(group_by)["barrier_eV"].idxmin()] \
         .sort_values(by="barrier_eV", ascending=True).reset_index(drop=True)
-
-    df_min_deltaE = df.loc[df.groupby("rxn")["deltaE_eV"].idxmin()] \
-        .sort_values(by="deltaE_eV", ascending=True).reset_index(drop=True)
 
     # Write output
     with pd.ExcelWriter(output_file) as writer:
-        df.to_excel(writer, sheet_name="raw", index=False)
-        df_avg.to_excel(writer, sheet_name="averaged", index=False)
+        df.to_excel(writer, sheet_name="downselected", index=False)
+        df_avg.to_excel(writer, sheet_name="averaged_barriers", index=False)
         df_min_barrier.to_excel(writer, sheet_name="min_barriers", index=False)
-        df_min_deltaE.to_excel(writer, sheet_name="min_deltaEs", index=False)
 
     print(f"\nProcessed summary written to: {output_file}")
 
-    return df, df_avg, df_min_barrier, df_min_deltaE
+    return df, df_avg, df_min_barrier
 
 def plot_barriers(
     df,
     use_min=True,
     only_singles=False,
     model_name="Model",
+    reactant_only=True,
 ):
 
     halide_colors = {
@@ -1027,8 +1079,14 @@ def plot_barriers(
                 if full in ("C10", "C12"):
                     return full
                 letter, number = match.group(1), match.group(2)
+                if number == "1":
+                    return letter
                 return f"{letter}$_{number}$"
             return re.sub(r"([A-Za-z])(\d+)", repl, name)
+
+        if reactant_only:
+            # keep only the molecular fragment, e.g. 'C10-ZnN4C+FeBr1Cl2' -> 'FeBr1Cl2'
+            return subscript_numbers_except_C10_C12(reactant_raw.split("+")[-1])
 
         reactant = subscript_numbers_except_C10_C12(reactant_raw)
         if product_raw:
@@ -1054,8 +1112,8 @@ def plot_barriers(
     colors   = [halide_color(h) for h in data_sorted["halide_ids"]]
     is_dep   = (data_sorted["rxn_type"] == "deposition").tolist()
 
+    plt.rcParams.update({'font.size': 22})
     fig, ax = plt.subplots(figsize=(11, 11))
-    plt.rcParams.update({'font.size': 16})
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#f7f7f7")
 
@@ -1095,22 +1153,30 @@ def plot_barriers(
             ax.text(barrier + 0.03, i, "★", va="center", ha="left",
                     color="#000000", fontweight="bold")
 
+    # Annotate each bar with its reaction energy
+    if "deltaE_eV" in data_sorted.columns:
+        for i, (barrier, dE) in enumerate(zip(barriers, data_sorted["deltaE_eV"])):
+            if pd.isna(dE):
+                continue
+            ax.text(0.03, i, rf"$\Delta E$ = {dE:+.2f} eV", va="center", ha="left",
+                    color="#000000", fontsize=14, zorder=5)
+
     
     # Y-axis labels
     ax.set_yticks(y)
     y_labels = [format_reaction_label(rxn) for rxn in data_sorted["rxn"]]
-    ax.set_yticklabels(y_labels, fontfamily="sans-serif", fontsize=18)
+    ax.set_yticklabels(y_labels, fontfamily="sans-serif") #, fontsize=22)
     for tick, dep in zip(ax.get_yticklabels(), is_dep):
         if dep:
             tick.set_fontweight("bold")
     
     # X-axis
-    ax.set_xlabel("Barrier (eV)", fontweight="medium", fontsize=20)
+    ax.set_xlabel("Barrier (eV)", fontweight="medium") #, fontsize=22)
     ax.set_xlim(0, max(barriers) + 0.3)
     ax.set_ylim(-0.6, len(labels) - 0.4)
     ax.xaxis.grid(True, color="#e0e0e0", zorder=0)
     ax.set_axisbelow(True)
-    ax.tick_params(axis='x', labelsize=18)
+    ax.tick_params(axis='x') #, labelsize=18)
     
     # Remove top/right spines
     for spine in ["top", "right"]:
@@ -1130,11 +1196,27 @@ def plot_barriers(
         for h in present_halides
     ]
     
-    ax.legend(handles=halide_patches, loc="upper right", framealpha=0.9, edgecolor="#dddddd")
+    present_counts = sorted({len(h) for h in present_halides})
+    style_labels = {1: "1 halide", 2: "2 halides", 3: "3 halides"}
+    style_patterns = {1: "-", 2: (0, (4, 2)), 3: ":"}
+    style_patches = [
+        mpatches.Patch(
+            facecolor="white",
+            edgecolor="#555555",
+            linewidth=1.5,
+            linestyle=style_patterns[n],
+            label=style_labels[n],
+        )
+        for n in present_counts if n in style_patterns
+    ]
+
+    color_legend = ax.legend(handles=halide_patches, loc="upper right", framealpha=0.9, edgecolor="#dddddd", fontsize=19)
+    ax.add_artist(color_legend)
+    ax.legend(handles=style_patches, loc="upper right", framealpha=0.9, edgecolor="#dddddd", bbox_to_anchor=(1.0, 0.34), fontsize=19)
     
     # Reflect dataset choice in plot title
     min_or_avg = "Minimums" if use_min else "Averaged"
-    plt.title(f"Summary for {model_name} : Complex barriers | {min_or_avg}", fontweight="bold", pad=10)
+    plt.title(f"Summary for {model_name} : Complex barriers | {min_or_avg}", fontweight="bold", pad=10, fontsize=18)
     model_str = model_name.replace(" ", "_").lower()
     outfile = f"barriers_{model_str}_{min_or_avg.lower()}.pdf"
     plt.savefig(outfile, dpi=200, bbox_inches="tight")
@@ -1155,7 +1237,7 @@ def run_neb_analysis(
     do_write_structures=False,
     do_write_movie=False,
     force_rerun=False,
-    max_path_length=None
+    rotations_sampling=False,
 ):
 
     summary_file = os.path.join(base_path, "neb_summary.xlsx")
@@ -1282,4 +1364,4 @@ def run_neb_analysis(
         print("No summary file found — skipping processing.")
         return
 
-    process_summary(base_path, max_path_length=max_path_length)
+    tag_summary(base_path, rotations_sampling=rotations_sampling)
