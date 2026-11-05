@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from ase.io import read, write
 from ase.mep import NEB
-from ase.optimize import BFGS, BFGSLineSearch, LBFGS, LBFGSLineSearch, GPMin, MDMin, FIRE
+from ase.optimize import BFGS, BFGSLineSearch, LBFGS, LBFGSLineSearch, GPMin, MDMin, FIRE, FIRE2
 from mace.calculators import MACECalculator
 from aseneb.config import RunConfig
 
@@ -14,6 +14,7 @@ OPTIMIZERS = {
     "GPMin": GPMin,
     "MDMin": MDMin,
     "FIRE": FIRE,
+    "FIRE2": FIRE2,
 }
 
 class MACERunner:
@@ -36,6 +37,13 @@ class MACERunner:
         print(f"Image dirs found ({len(folders)}):",", ".join(d.name for d in folders))
         images = [read(f / "POSCAR") for f in folders]
         return images
+
+    def load_images_from_traj(self, trajfile):
+        n_images = len(self.load_images())
+
+        frames = read(trajfile, index=":")
+
+        return frames[-n_images:]
 
     def attach_calculators(self, images):
         for i, img in enumerate(images):
@@ -80,29 +88,75 @@ class MACERunner:
 
         return outfile
 
-    def run(self):
-        images = self.load_images()
+    def run_neb(self, images, k, climb, logfile, trajectory):
+
         self.attach_calculators(images)
 
         neb = NEB(
             images,
-            k=self.cfg.neb.k,
-            climb=self.cfg.neb.climb,
+            k=k,
+            climb=climb,
             method=self.cfg.neb.method,
         )
 
         opt_cls = OPTIMIZERS[self.cfg.optimizer.name]
+
         opt_kwargs = {
-            "logfile": "neb.log",
-            "trajectory": "neb.traj",
+            "logfile": logfile,
+            "trajectory": trajectory,
         }
+
         if self.cfg.optimizer.a is not None:
             opt_kwargs["a"] = self.cfg.optimizer.a
 
         optimizer = opt_cls(neb, **opt_kwargs)
+
         optimizer.run(
             fmax=self.cfg.optimizer.fmax,
             steps=self.cfg.optimizer.steps,
         )
 
-        print("NEB run completed.")
+    def run(self):
+
+        # Original single-stage behavior
+        if not self.cfg.neb_stages:
+
+            images = self.load_images()
+
+            self.run_neb(
+                images=images,
+                k=self.cfg.neb.k,
+                climb=self.cfg.neb.climb,
+                logfile="neb.log",
+                trajectory="neb.traj",
+            )
+
+            print("NEB run completed.")
+            return
+
+        # Multi-stage behavior
+        images = self.load_images()
+
+        for i, stage in enumerate(self.cfg.neb_stages):
+
+            print(
+                f"Running NEB stage {i + 1}: "
+                f"k={stage.k}, climb={stage.climb}"
+            )
+
+            trajfile = f"neb_stage{i}.traj"
+            logfile = f"neb_stage{i}.log"
+
+            self.run_neb(
+                images=images,
+                k=stage.k,
+                climb=stage.climb,
+                logfile=logfile,
+                trajectory=trajfile,
+            )
+
+            # Restart next stage from final band
+            if i < len(self.cfg.neb_stages) - 1:
+                images = self.load_images_from_traj(trajfile)
+
+        print("All NEB stages completed.")

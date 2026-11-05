@@ -17,14 +17,20 @@ HEADER_OVERRIDES = {}
 SAMPLINGS = ["c", "d", "dr", "r"]
 
 SAMPLING_PATTERN = re.compile(
-    r"^(.*?)_(c|d|dr|r)_TO_(.*?)_(c|d|dr|r)_finalfittedpath$"
+    r"^(.*?)_(c|d|dr|r)_TO_(.*?)_(c|d|dr|r)$"
 )
 
-def matches_system(name: str) -> bool:
-    return (
-        name.lower().endswith(".png")
-        and "_finalfittedpath" in name
-    )
+def matches_system(name: str, suffix: str) -> bool:
+
+    if not name.lower().endswith(".png"):
+        return False
+
+    stem = os.path.splitext(name)[0]
+
+    if suffix == "":
+        return True
+
+    return stem.endswith(suffix)
 
 def display_name_for_dir(directory: str) -> str:
     base = os.path.basename(os.path.normpath(directory))
@@ -37,7 +43,7 @@ def clean_dir_name(path):
 # Mode 1: Compare directories
 # ==========================================================
 
-def collect_directory_images(method_dirs):
+def collect_directory_images(method_dirs,suffix="finalfittedpath"):
     per_method = defaultdict(dict)
 
     for method_dir in method_dirs:
@@ -46,15 +52,14 @@ def collect_directory_images(method_dirs):
 
         display_method = display_name_for_dir(method_dir)
 
-        for dirpath, _, filenames in os.walk(method_dir):
-            for filename in filenames:
-                if not matches_system(filename):
-                    continue
+        for filename in os.listdir(method_dir):
+            if not matches_system(filename, suffix):
+                continue
 
-                system_name = os.path.splitext(filename)[0]
-                full_path = os.path.join(dirpath, filename)
+            system_name = os.path.splitext(filename)[0]
+            full_path = os.path.join(method_dir, filename)
 
-                per_method[display_method][system_name] = full_path
+            per_method[display_method][system_name] = full_path
 
     methods = [display_name_for_dir(d) for d in method_dirs]
 
@@ -84,36 +89,37 @@ def collect_directory_images(method_dirs):
 # Mode 2: Compare c/d/dr/r samplings within one directory
 # ==========================================================
 
-def collect_sampling_images(directory):
+def collect_sampling_images(directory,suffix="finalfittedpath"):
 
     systems = defaultdict(dict)
 
-    for dirpath, _, filenames in os.walk(directory):
+    for filename in os.listdir(directory):
 
-        for filename in filenames:
+        if not matches_system(filename, suffix):
+            continue
 
-            if not matches_system(filename):
-                continue
+        stem = os.path.splitext(filename)[0]
 
-            stem = os.path.splitext(filename)[0]
+        if suffix:
+            stem = stem.removesuffix(suffix)
 
-            match = SAMPLING_PATTERN.match(stem)
+        match = SAMPLING_PATTERN.match(stem)
 
-            if match is None:
-                continue
+        if match is None:
+            continue
 
-            reactant, samp1, product, samp2 = match.groups()
+        reactant, samp1, product, samp2 = match.groups()
 
-            # Safety check
-            if samp1 != samp2:
-                continue
+        # Safety check
+        if samp1 != samp2:
+            continue
 
-            system_name = f"{reactant}_TO_{product}"
+        system_name = f"{reactant}_TO_{product}"
 
-            systems[system_name][samp1] = os.path.join(
-                dirpath,
-                filename
-            )
+        systems[system_name][samp1] = os.path.join(
+            directory,
+            filename
+        )
 
     # Keep only complete c/d/dr/r sets
     complete_systems = {}
@@ -128,6 +134,34 @@ def collect_sampling_images(directory):
             }
 
     return SAMPLINGS, complete_systems
+
+
+# ==========================================================
+# Mode 3: Show all matching images from one directory
+# ==========================================================
+
+def collect_all_images(directory, suffix="finalfittedpath"):
+
+    method_name = display_name_for_dir(directory)
+    systems = {}
+
+    for filename in sorted(os.listdir(directory)):
+
+        if not matches_system(filename, suffix):
+            continue
+
+        stem = os.path.splitext(filename)[0]
+
+        if suffix:
+            system_name = stem.removesuffix(suffix)
+        else:
+            system_name = stem
+
+        systems[system_name] = {
+            method_name: os.path.join(directory, filename)
+        }
+
+    return [method_name], systems
 
 
 # ==========================================================
@@ -147,7 +181,7 @@ def render_pdf(
 
     if not system_names:
         raise SystemExit(
-            "No complete image sets found."
+            "No matching image sets found."
         )
 
     with PdfPages(output_path) as pdf:
@@ -176,8 +210,12 @@ def render_pdf(
                 constrained_layout=True,
             )
 
-            if nrows == 1:
+            if nrows == 1 and len(methods) == 1:
+                axes = [[axes]]
+            elif nrows == 1:
                 axes = [axes]
+            elif len(methods) == 1:
+                axes = [[ax] for ax in axes]
 
             for row_idx, system_name in enumerate(page_names):
 
@@ -254,7 +292,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "If one directory is supplied, compare "
-            "c/d/dr/r samplings. If multiple "
+            "c/d/dr/r samplings or render all matching "
+            "images in a single column. If multiple "
             "directories are supplied, compare "
             "directories."
         )
@@ -264,9 +303,30 @@ def main():
         "dirs",
         nargs="+",
         help=(
-            "One directory (sampling comparison) "
-            "or multiple directories "
+            "One directory (sampling comparison or "
+            "single-column render) or multiple directories "
             "(directory comparison)."
+        ),
+    )
+
+    parser.add_argument(
+        "--single-dir-mode",
+        choices=["sampling", "all"],
+        default="sampling",
+        help=(
+            "Behavior when one directory is supplied: "
+            "'sampling' compares c/d/dr/r image sets, "
+            "'all' renders every matching image in one column."
+        ),
+    )
+
+    parser.add_argument(
+        "--suffix",
+        default="finalfittedpath",
+        help=(
+            "PNG suffix to match before .png. "
+            "Examples: 'finalfittedpath', "
+            "'finalpath', or '' for all PNGs."
         ),
     )
 
@@ -314,14 +374,23 @@ def main():
 
     if len(args.dirs) == 1:
 
-        print(
-            f"Sampling comparison mode: "
-            f"{args.dirs[0]}"
-        )
+        resolved = str(Path(args.dirs[0]).resolve())
 
-        methods, systems = collect_sampling_images(
-            args.dirs[0]
-        )
+        if args.single_dir_mode == "sampling":
+            print(f"Sampling comparison mode: {resolved}")
+
+            methods, systems = collect_sampling_images(
+                args.dirs[0],
+                suffix=args.suffix
+            )
+
+        else:
+            print(f"Single-column image mode: {resolved}")
+
+            methods, systems = collect_all_images(
+                args.dirs[0],
+                suffix=args.suffix
+            )
 
     else:
 
@@ -330,10 +399,11 @@ def main():
         )
 
         for d in args.dirs:
-            print(f"  {d}")
+            print(f"  {Path(d).resolve()}")
 
         methods, systems = collect_directory_images(
-            args.dirs
+            args.dirs,
+            suffix=args.suffix
         )
 
     render_pdf(
